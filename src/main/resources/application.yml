@@ -1,3 +1,6 @@
 spring:
   application:
     name: cicd
+
+server:
+  port: 8081
