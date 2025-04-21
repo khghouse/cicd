@@ -2,8 +2,8 @@ pipeline {
     agent any
 
     environment {
-        IMAGE_NAME = "springboot-app"
-        CONTAINER_NAME = "springboot-app-container"
+        IMAGE_NAME = "springboot-app-image"
+        CONTAINER_NAME = "springboot-app"
     }
 
     stages {
@@ -15,7 +15,7 @@ pipeline {
 
         stage('Build JAR') {
             steps {
-                sh './gradlew clean build --no-daemon --max-workers=1'
+                sh './gradlew clean build'
             }
         }
 
