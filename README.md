@@ -1,11 +1,11 @@
 ### 실습 목표
 
-- AWS EC2 서버에 Docker 기반 Jenkins를 설치하고 설정한다.
-- Jenkins를 활용해 Spring Boot 프로젝트를 자동 빌드, 배포하는 CI/CD 파이프라인을 구축한다.
+- Jenkins를 전용 빌드 서버로 구성하여, 소스 코드를 빌드하고 Docker 이미지를 생성한다.
+- 운영 서버는 빌드 서버와 분리된 환경에서, 전달받은 Docker 이미지를 실행하고 서비스를 운영하는 역할만 수행한다.
 
 <br />
 
-### 1. Docker 설치
+### 1. Docker & Docker Compose 설치
 
 ```shell
 # Docker 설치
@@ -18,9 +18,24 @@ docker --version
 # 현재 사용자(ec2-user)를 docker 그룹에 추가
 sudo usermod -aG docker ec2-user
 
+# Docker Compose 설치
+sudo curl -L "https://github.com/docker/compose/releases/download/v2.24.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+sudo chmod +x /usr/local/bin/docker-compose
+
+# 현재 도커 그룹 ID 확인
+export DOCKER_GID=$(getent group docker | cut -d: -f3)
+
+# .env 파일 생성
+echo "DOCKER_GID=$DOCKER_GID" > .env
+
+# Jenkins 빌드 및 실행
+docker-compose up -d --build
+
 # 변경된 그룹 권한을 현재 셀에 반영
 newgrp docker
 ```
+
+<br />
 
 ### 2. Dockerfile 생성
 
@@ -46,42 +61,56 @@ RUN curl -fsSL https://download.docker.com/linux/debian/gpg | apt-key add - && \
     apt-get update && \
     apt-get install -y docker-ce-cli
 
+# Docker Compose 설치
+RUN curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
+    -o /usr/local/bin/docker-compose \
+ && chmod +x /usr/local/bin/docker-compose
+
 # Jenkins 사용 권한으로 되돌림
 USER jenkins
 ```
 
+<br />
+
 ### 3. 커스텀 Jenkins Docker 이미지 빌드
 
-- Docker CLI가 포함된 젠킨스 커스텀 이미지 빌드
+- Docker CLI, Docker Compose가 포함된 젠킨스 커스텀 이미지 빌드
 - 현재 디렉토리에 Dockerfile 필요
 
 ```shell
 docker build -t custom-jenkins:lts-jdk17-docker .
 ```
 
-### 4. Jenkins 컨테이너 실행
+<br />
 
-```shell
-# 기존 Jenkins 컨테이너 중지 및 삭제
-docker stop jenkins || true
-docker rm jenkins || true
+### 4. docker-compose.yml
 
-# jenkins_home 디렉토리 생성 및 퍼미션 설정
-mkdir -p ~/jenkins_home
+```yaml
+version: '3.8'
 
-# Jenkins UID(1000)에 디렉토리 소유권 부여
-sudo chown -R 1000:1000 ~/jenkins_home
+services:
+  jenkins:
+    build:
+      context: .
+    container_name: jenkins
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/group:/etc/group:ro
+    environment:
+      - TZ=Asia/Seoul
+    restart: unless-stopped
+    group_add:
+      - "${DOCKER_GID:-998}"
 
-# Jenkins 컨테이너 실행
-docker run -d --name jenkins \
-  -p 8080:8080 -p 50000:50000 \
-  -v ~/jenkins_home:/var/jenkins_home \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v /etc/group:/etc/group:ro \
-  --restart unless-stopped \
-  --group-add $(getent group docker | cut -d: -f3) \
-  custom-jenkins:lts-jdk17-docker
+volumes:
+  jenkins_home:
 ```
+
+<br />
 
 ### 5. Jenkins 접속 및 설정
 
@@ -94,13 +123,13 @@ http://{EC2_PUBLIC_IP}:8080
 #### 초기 비밀번호 확인
 
 ```shell
-cat /jenkins_home/secrets/initialAdminPassword
+docker exec jenkins cat /var/jenkins_home/secrets/initialAdminPassword
 ```
 
 #### 플러그인 설치
 
 - Suggested plugins 선택
-- 추가 플러그인 설치 : Docker Pipeline, Docker Commons Plugin, Docker API Plugin
+- 추가 플러그인 설치 : Docker Pipeline, Docker Commons Plugin, Docker API Plugin, SSH Agent Plugin
 
 #### Job 생성
 
@@ -113,6 +142,19 @@ cat /jenkins_home/secrets/initialAdminPassword
         - Repository URL : https://github.com/{계정아이디}/{리포지토리명}.git
         - Branch : master (또는 현재 사용중인 브랜치)
         - Script Path : Jenkinsfile (디폴트)
+
+#### Credential 등록
+
+Jenkins에서 운영 서버 접근을 위해 .pem 파일을 등록해야 합니다.
+
+- Jenkins 관리 -> Credentials -> (global) -> Add Credentials
+    - Kind : SSH Username with private key
+    - Username : ec2-user (Amazon Linux2의 기본 사용자 이름)
+    - ID : ec2-cicd-key (원하는 ID, Jenkinsfile에서 사용)
+    - Enter directly 체크
+        - .pem 파일 내용 복사
+
+<br />
 
 ### 6. 프로젝트 내부에 Jenkinsfile, Dockerfile 생성
 
@@ -134,14 +176,16 @@ pipeline {
     agent any
 
     environment {
+        REMOTE_HOST = 'ec2-user@{ec2-ip}'
+        TARGET_DIR = '/home/ec2-user/app'
         IMAGE_NAME = "springboot-app-image"
-        CONTAINER_NAME = "springboot-app"
+        CONTAINER_NAME = "spring-app"
     }
 
     stages {
-        stage('Checkout') {
+        stage('Clone Source') {
             steps {
-                git 'https://github.com/khghouse/cicd.git'
+                git url: 'https://github.com/khghouse/cicd.git', branch: 'master'
             }
         }
 
@@ -151,18 +195,28 @@ pipeline {
             }
         }
 
-        stage('Build Docker Image') {
+        stage('Docker Build & Save') {
             steps {
-                sh "docker build -t ${IMAGE_NAME} ."
+                sh """
+                    docker build -t $IMAGE_NAME .
+                    docker save $IMAGE_NAME > docker-image.tar
+                """
             }
         }
 
-        stage('Run Container') {
+        stage('Deploy') {
             steps {
-                sh """
-                docker rm -f ${CONTAINER_NAME} || true
-                docker run -d --name ${CONTAINER_NAME} -p 8081:8080 ${IMAGE_NAME}
-                """
+                sshagent(credentials: ['ec2-cicd-key']) {
+                    sh """
+                        scp -o StrictHostKeyChecking=no docker-image.tar $REMOTE_HOST:/tmp/
+                        ssh -o StrictHostKeyChecking=no $REMOTE_HOST '
+                            docker stop $CONTAINER_NAME || true &&
+                            docker rm $CONTAINER_NAME || true &&
+                            docker load < /tmp/docker-image.tar &&
+                            docker run -d --name $CONTAINER_NAME -p 8080:8080 $IMAGE_NAME
+                        '
+                    """
+                }
             }
         }
     }
@@ -181,7 +235,28 @@ COPY ${JAR_FILE} app.jar
 ENTRYPOINT ["java","-jar","/app.jar"]
 ```
 
-### (선택) 7. SwapFile 생성
+<br />
+
+### 7. 운영 서버 도커 설치
+
+```shell
+# Docker 설치
+sudo yum update -y
+sudo yum install -y docker
+sudo systemctl start docker
+sudo systemctl enable docker
+docker --version
+
+# 현재 사용자(ec2-user)를 docker 그룹에 추가
+sudo usermod -aG docker ec2-user
+
+# 변경된 그룹 권한을 현재 셀에 반영
+newgrp docker
+```
+
+<br />
+
+### (선택) 8. SwapFile 생성
 
 - EC2 메모리가 부족한 경우 스왑 메모리 추가
     - EC2(프리티어 버전)을 사용할 경우 메모리 부족 현상 발생
@@ -214,10 +289,23 @@ sudo vi /etc/fstab
 /swapfile swap swap defaults 0 0
 ```
 
-### 8. 빌드 및 배포
+<br />
+
+### 9. 빌드 및 배포
 
 - Jenkins 접속 -> Job 선택 -> 지금 빌드 버튼 클릭
-    - 성공 시 콘솔에 Spring Boot 프로젝트 빌드 → Docker 이미지 생성 → 컨테이너 실행
+
+<br />
+
+### 10. 실습 요약
+
+이번 실습을 통해 Jenkins를 빌드 전용 서버로 분리하고, 운영 서버에는 오직 빌드된 Docker 이미지만 배포하는 구조로 개선했습니다.
+
+<br />
+
+### 관련 코드
+
+- https://github.com/khghouse/cicd
 
 <br />
 
