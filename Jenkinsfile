@@ -35,11 +35,15 @@ pipeline {
                 sshagent (credentials: ['ec2-cicd-key']) {
                     sh """
                         scp -o StrictHostKeyChecking=no docker-image.tar $REMOTE_HOST:/tmp/
+                        scp -o StrictHostKeyChecking=no docker-compose.yml $REMOTE_HOST:$TARGET_DIR/
+
                         ssh -o StrictHostKeyChecking=no $REMOTE_HOST '
-                            docker stop $CONTAINER_NAME || true &&
-                            docker rm $CONTAINER_NAME || true &&
-                            docker load < /tmp/docker-image.tar &&
-                            docker run -d --name $CONTAINER_NAME -p 8080:8080 $IMAGE_NAME
+                            mkdir -p $TARGET_DIR &&
+                            mv /tmp/docker-image.tar $TARGET_DIR &&
+                            cd $TARGET_DIR &&
+                            docker-compose down || true &&
+                            docker load < docker-image.tar &&
+                            docker-compose up -d
                         '
                     """
                 }
