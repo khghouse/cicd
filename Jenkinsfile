@@ -37,6 +37,7 @@ pipeline {
             steps {
                 sshagent(credentials: ['ec2-cicd-key']) {
                     sh """
+                        ssh -o StrictHostKeyChecking=no $SERVER_1 'mkdir -p $TARGET_DIR'
                         scp -o StrictHostKeyChecking=no docker-image.tar $SERVER_1:/tmp/
                         scp -o StrictHostKeyChecking=no docker-compose.yml $SERVER_1:$TARGET_DIR/
 
@@ -65,6 +66,7 @@ pipeline {
             steps {
                 sshagent(credentials: ['ec2-cicd-key']) {
                     sh """
+                        ssh -o StrictHostKeyChecking=no $SERVER_2 'mkdir -p $TARGET_DIR'
                         scp -o StrictHostKeyChecking=no docker-image.tar $SERVER_2:/tmp/
                         scp -o StrictHostKeyChecking=no docker-compose.yml $SERVER_2:$TARGET_DIR/
 
