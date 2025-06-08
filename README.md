@@ -1,7 +1,14 @@
 ### 실습 목표
 
-- Jenkins를 전용 빌드 서버로 구성하여, 소스 코드를 빌드하고 Docker 이미지를 생성한다.
-- 운영 서버는 빌드 서버와 분리된 환경에서, 전달받은 Docker 이미지를 실행하고 서비스를 운영하는 역할만 수행한다.
+- 두 대의 운영 서버에 헬스 체크를 기반으로 안전하게 순차 배포하는 CI/CD 환경을 구축한다.
+
+<br />
+
+### 0. 이전 작업
+
+- 이전에는 단일 서버에 Jenkins를 이용하여 배포하는 구조였습니다.
+    - https://github.com/khghouse/study/blob/main/practice/jenkins/3.%20jenkins-build-deploy-separated.md
+- 이번 실습은 운영 서버 2대에 무중단/순차 배포를 목표로 확장된 환경을 구축합니다.
 
 <br />
 
@@ -91,7 +98,7 @@ version: '3.8'
 services:
   jenkins:
     build:
-      context: .
+      context: ..
     container_name: jenkins
     ports:
       - "8080:8080"
@@ -108,6 +115,12 @@ services:
 
 volumes:
   jenkins_home:
+```
+
+Jenkins 빌드 및 실행
+
+```shell
+docker-compose up -d --build
 ```
 
 <br />
@@ -156,13 +169,13 @@ Jenkins에서 운영 서버 접근을 위해 .pem 파일을 등록해야 합니�
 
 <br />
 
-### 6. 프로젝트 내부에 Jenkinsfile, Dockerfile 생성
+### 6. 프로젝트 내부에 Jenkinsfile, docker-compose.yml 생성 및 health-check
 
 #### 디렉토리 구조
 
 ```text
 /cicd
-├── Dockerfile                  ✅
+├── docker-compose-yml          ✅
 ├── Jenkinsfile                 ✅
 ├── src/
 │   ├── main/
@@ -176,10 +189,13 @@ pipeline {
     agent any
 
     environment {
-        REMOTE_HOST = 'ec2-user@{ec2-ip}'
+        SERVER_1 = 'ec2-user@{ec2-ip-1}'
+        SERVER_2 = 'ec2-user@{ec2-ip-2}'
         TARGET_DIR = '/home/ec2-user/app'
         IMAGE_NAME = "springboot-app-image"
         CONTAINER_NAME = "spring-app"
+        PORT = "8080"
+        HEALTH_ENDPOINT = "/actuator/health"
     }
 
     stages {
@@ -204,18 +220,60 @@ pipeline {
             }
         }
 
-        stage('Deploy') {
+        stage('Deploy to Server 1') {
             steps {
                 sshagent(credentials: ['ec2-cicd-key']) {
                     sh """
-                        scp -o StrictHostKeyChecking=no docker-image.tar $REMOTE_HOST:/tmp/
-                        ssh -o StrictHostKeyChecking=no $REMOTE_HOST '
-                            docker stop $CONTAINER_NAME || true &&
-                            docker rm $CONTAINER_NAME || true &&
-                            docker load < /tmp/docker-image.tar &&
-                            docker run -d --name $CONTAINER_NAME -p 8080:8080 $IMAGE_NAME
+                        ssh -o StrictHostKeyChecking=no $SERVER_1 'mkdir -p $TARGET_DIR'
+                        scp -o StrictHostKeyChecking=no docker-image.tar $SERVER_1:/tmp/
+                        scp -o StrictHostKeyChecking=no docker-compose.yml $SERVER_1:$TARGET_DIR/
+
+                        ssh -o StrictHostKeyChecking=no $SERVER_1 '
+                            mkdir -p $TARGET_DIR &&
+                            mv /tmp/docker-image.tar $TARGET_DIR &&
+                            cd $TARGET_DIR &&
+                            docker-compose down || true &&
+                            docker load < docker-image.tar &&
+                            docker-compose up -d
                         '
                     """
+
+                    echo "Waiting for Server 1 to become healthy..."
+                    retry(5) {
+                        sleep(time: 5, unit: "SECONDS")
+                        sh """
+                            curl --fail http://${SERVER_1.split('@')[1]}:${PORT}${HEALTH_ENDPOINT} | grep '\"status\":\"UP\"'
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to Server 2') {
+            steps {
+                sshagent(credentials: ['ec2-cicd-key']) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no $SERVER_2 'mkdir -p $TARGET_DIR'
+                        scp -o StrictHostKeyChecking=no docker-image.tar $SERVER_2:/tmp/
+                        scp -o StrictHostKeyChecking=no docker-compose.yml $SERVER_2:$TARGET_DIR/
+
+                        ssh -o StrictHostKeyChecking=no $SERVER_2 '
+                            mkdir -p $TARGET_DIR &&
+                            mv /tmp/docker-image.tar $TARGET_DIR &&
+                            cd $TARGET_DIR &&
+                            docker-compose down || true &&
+                            docker load < docker-image.tar &&
+                            docker-compose up -d
+                        '
+                    """
+
+                    echo "Waiting for Server 2 to become healthy..."
+                    retry(5) {
+                        sleep(time: 5, unit: "SECONDS")
+                        sh """
+                            curl --fail http://${SERVER_2.split('@')[1]}:${PORT}${HEALTH_ENDPOINT} | grep '\"status\":\"UP\"'
+                        """
+                    }
                 }
             }
         }
@@ -223,21 +281,39 @@ pipeline {
 }
 ```
 
-#### Dockerfile
+#### docker-compose.yml
 
-```dockerfile
-FROM amazoncorretto:17
+```yaml
+version: '3.8'
 
-ARG JAR_FILE=build/libs/cicd-0.0.1-SNAPSHOT.jar
+services:
+  spring-app:
+    image: springboot-app-image
+    container_name: spring-app
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+```
 
-COPY ${JAR_FILE} app.jar
+#### health-check
 
-ENTRYPOINT ["java","-jar","/app.jar"]
+```groovy
+// build.gradle
+implementation 'org.springframework.boot:spring-boot-starter-actuator'
+```
+
+```yaml
+# application.yml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
 ```
 
 <br />
 
-### 7. 운영 서버 도커 설치
+### 7. 운영 서버 Docker & Docker Compose 설치
 
 ```shell
 # Docker 설치
@@ -252,6 +328,11 @@ sudo usermod -aG docker ec2-user
 
 # 변경된 그룹 권한을 현재 셀에 반영
 newgrp docker
+
+# Docker Compose 설치
+sudo curl -L "https://github.com/docker/compose/releases/download/v2.24.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+sudo chmod +x /usr/local/bin/docker-compose
+docker-compose --version
 ```
 
 <br />
@@ -291,15 +372,9 @@ sudo vi /etc/fstab
 
 <br />
 
-### 9. 빌드 및 배포
+### 9. 실습 요약
 
-- Jenkins 접속 -> Job 선택 -> 지금 빌드 버튼 클릭
-
-<br />
-
-### 10. 실습 요약
-
-이번 실습을 통해 Jenkins를 빌드 전용 서버로 분리하고, 운영 서버에는 오직 빌드된 Docker 이미지만 배포하는 구조로 개선했습니다.
+이번 실습을 통해 Jenkins를 활용하여 하나의 애플리케이션을 두 대의 운영 서버에 순차적으로 자동 배포하는 환경을 구축하였습니다.
 
 <br />
 
